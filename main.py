@@ -1,5 +1,6 @@
 from huggingface_hub import snapshot_download
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import torch
 
 from pathlib import Path
 
@@ -14,22 +15,89 @@ else:
     print(f"Model already downloaded to {mistral_models_path}")
 
 from transformers import AutoModelForCausalLM
- 
-model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2", load_in_4bit=True)
-model.to("cuda")
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training    
 
-messages = [
-    {"role": "user", "content": "What is your favourite condiment?"},
-    {"role": "assistant", "content": "Well, I'm quite partial to a good squeeze of fresh lemon juice. It adds just the right amount of zesty flavour to whatever I'm cooking up in the kitchen!"},
-    {"role": "user", "content": "Do you have mayonnaise recipes?"}
-]
+from datasets import load_dataset
+
+dataset = load_dataset("openai/gsm8k","main", split="train")
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    "mistralai/Mistral-7B-Instruct-v0.2", 
+    quantization_config=bnb_config, 
+    device_map="auto", 
+    torch_dtype=torch.bfloat16)
+
+device = torch.device("cuda")
+model.to(device)
+
+model.gradient_checkpointing_enable()
+
+
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=32,
+    lora_dropout=0.1,
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+    task_type="CAUSAL_LM",
+    bias="none",
+)
+
+model = prepare_model_for_kbit_training(model)
+model = get_peft_model(model, lora_config)
+
+
 
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
-encodeds = tokenizer.apply_chat_template(messages, return_tensors="pt")
-model_inputs = encodeds.to("cuda")
- 
-generated_ids = model.generate(model_inputs, max_new_tokens=1000, do_sample=True)
+tokenizer.pad_token = tokenizer.eos_token  # Set pad token
+tokenizer.padding_side = "right"
 
-# decode with mistral tokenizer
-result = tokenizer.decode(generated_ids[0].tolist())
-print(result)
+def format_dataset(examples):
+    q = examples["question"]
+    a = examples["answer"]
+    
+    prompt = f"[INST] {q} [/INST] {a}"
+    res = {
+        "text": prompt,
+    }
+    return res
+
+dataset = dataset.map(format_dataset)
+train_dataset = dataset.shuffle(seed=42)
+
+from trl import SFTTrainer, SFTConfig
+
+training_config = SFTConfig(
+    output_dir="/scratch/ks02450/lora-finetuned",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    gradient_checkpointing=True,
+    optim="paged_adamw_32bit",
+    logging_steps=25,
+    learning_rate=2e-4,
+    bf16=True,                   # Use bfloat16 for speed (if supported)
+    max_grad_norm=0.3,
+    warmup_ratio=0.03,
+    lr_scheduler_type="constant",
+    num_train_epochs=3,
+    save_steps=500,
+    logging_dir="/scratch/ks02450/logs",
+    dataset_text_field="text",
+)
+
+trainer = SFTTrainer(
+    model=model,
+    args=training_config,
+    train_dataset=train_dataset,
+    peft_config=lora_config,
+)
+
+trainer.train()
+
+trainer.save_model("/scratch/ks02450/lora-finetuned-gsm8k/")

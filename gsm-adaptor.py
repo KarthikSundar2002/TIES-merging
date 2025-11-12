@@ -5,14 +5,14 @@ import torch
 from pathlib import Path
 
 
-mistral_models_path = Path('/scratch/ks02450/').joinpath('mistral_models', '7B-Instruct-v0.2')
+qwen_models_path = Path('/scratch/ks02450/').joinpath('qwen_models', '4B-Instruct-2507')
 
 
-if not mistral_models_path.exists():
-    mistral_models_path.mkdir(parents=True, exist_ok=True)
-    snapshot_download(repo_id="mistralai/Mistral-7B-Instruct-v0.2", allow_patterns=["params.json", "consolidated.safetensors", "tokenizer.model", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"], local_dir=mistral_models_path)
+if not qwen_models_path.exists():
+    qwen_models_path.mkdir(parents=True, exist_ok=True)
+    snapshot_download(repo_id="Qwen/Qwen3-4B-Instruct-2507", allow_patterns=["params.json", "consolidated.safetensors", "tokenizer.model", "tokenizer.json", "tokenizer_config.json"], local_dir=qwen_models_path)
 else:
-    print(f"Model already downloaded to {mistral_models_path}")
+    print(f"Model already downloaded to {qwen_models_path}")
 
 from transformers import AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training    
@@ -29,7 +29,7 @@ bnb_config = BitsAndBytesConfig(
 )
 
 model = AutoModelForCausalLM.from_pretrained(
-    "mistralai/Mistral-7B-Instruct-v0.2", 
+    "Qwen/Qwen3-4B-Instruct-2507", 
     quantization_config=bnb_config, 
     device_map="auto", 
     torch_dtype=torch.bfloat16)
@@ -54,7 +54,7 @@ model = get_peft_model(model, lora_config)
 
 
 
-tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
 tokenizer.pad_token = tokenizer.eos_token  # Set pad token
 tokenizer.padding_side = "right"
 

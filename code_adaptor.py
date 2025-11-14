@@ -63,8 +63,14 @@ lora_config = LoraConfig(
     bias="none",
 )
 
+
+print("Before PEFT")
+for name, param in model.named_parameters():
+    print(name, param.shape)
+
+
 model = prepare_model_for_kbit_training(model)
-model = get_peft_model(model, lora_config)
+model = get_peft_model(model, lora_config, adapter_name="code-specialist")
 
 
 

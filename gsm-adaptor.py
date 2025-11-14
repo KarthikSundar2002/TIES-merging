@@ -15,7 +15,7 @@ else:
     print(f"Model already downloaded to {qwen_models_path}")
 
 from transformers import AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training    
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftConfig   
 
 from datasets import load_dataset
 
@@ -34,11 +34,13 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto", 
     torch_dtype=torch.bfloat16)
 
+
 device = torch.device("cuda")
 model.to(device)
 
 model.gradient_checkpointing_enable()
-
+# for name, param in model.named_parameters():
+#     print(name, param.shape)
 
 lora_config = LoraConfig(
     r=8,
@@ -50,9 +52,10 @@ lora_config = LoraConfig(
 )
 
 model = prepare_model_for_kbit_training(model)
-model = get_peft_model(model, lora_config)
-
-
+model = get_peft_model(model, lora_config, adapter_name="gsm_specialist")
+# print("After PEFT")
+# for name, param in model.named_parameters():
+#     print(name, param.shape)
 
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
 tokenizer.pad_token = tokenizer.eos_token  # Set pad token

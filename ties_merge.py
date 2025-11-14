@@ -61,8 +61,10 @@ pruning_percent = 1 - k_density
 #Creating Task Vectors
 gsm_task_vectors = []
 for name, tensor in gsm_adaptor.named_parameters():
+    if "gsm_specialist" in name:
+        continue
     for lora_name in lora_modules:
-        if lora_name in name:
+        if lora_name in name and "lora" in name:
             gsm_task_vectors.append(tensor.abs().flatten())
 
 gsm_task_vectors = torch.cat(gsm_task_vectors).to(torch.uint8)
@@ -83,8 +85,10 @@ gsm_task_vectors[mask_gsm_task_vectors] = 0
 
 code_task_vectors = []
 for name, tensor in code_adaptor.named_parameters():
+    if "gsm_specialist" in name:
+        continue
     for lora_name in lora_modules:
-        if lora_name in name:
+        if lora_name in name and "lora" in name:
             code_task_vectors.append(tensor.abs().flatten())
 
 code_task_vectors = torch.cat(code_task_vectors).to(torch.uint8)
@@ -103,19 +107,23 @@ print(code_task_vectors)
 
 
 for name, param in gsm_adaptor.named_parameters():
+    if "code_specialist" in name:
+        continue
     for lora_name in lora_modules:
-        if lora_name in name:
+        if lora_name in name and "lora" in name:
             gsm_tensor = param.data
+            code_param_name = name.replace("gsm_specialist", "code_specialist")
             code_tensor = code_adaptor.get_parameter(name).data
             gsm_mask = gsm_tensor.abs() > median_gsm
             code_mask = code_tensor.abs() > median_code
+
             masked_gsm_tensor = gsm_tensor * gsm_mask
             masked_code_tensor = code_tensor * code_mask
             
             sign_gsm = torch.sign(masked_gsm_tensor)
             sign_code = torch.sign(masked_code_tensor)
             
-            elected_sign_tensor = torch.sign(sign_gsm * gsm_mask + sign_code * code_mask)
+            elected_sign_tensor = torch.sign(sign_gsm * masked_gsm_tensor + sign_code * masked_code_tensor)
             a = torch.sum(elected_sign_tensor)
             if a > 0:
                 elected_sign = 1
@@ -128,8 +136,10 @@ for name, param in gsm_adaptor.named_parameters():
             disjoint_mask_code = sign_code == elected_sign
             
             merged_tensor = (masked_gsm_tensor * disjoint_mask_gsm + masked_code_tensor * disjoint_mask_code) / 2
-            ties_merged_model_dict[name] = merged_tensor    
+            res_param_name = name.replace("gsm_specialist", "ties_merged")
+            ties_merged_model_dict[res_param_name] = merged_tensor    
         else:
             ties_merged_model_dict[name] = param.data.clone()
-
+            break
+print(ties_merged_model_dict.keys())
 torch.save(ties_merged_model_dict, qwen_models_path.joinpath('ties_merged_model.pth'))

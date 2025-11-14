@@ -47,17 +47,24 @@ tokenizer.padding_side = "right"
 gsm_adaptor_path = Path('/scratch/ks02450/').joinpath('lora-finetuned-gsm8k')
 code_adaptor_path = Path('/scratch/ks02450/').joinpath('lora-finetuned-code-adaptor')
 
-gsm_adaptor = PeftModel.from_pretrained(model, gsm_adaptor_path)
-code_adaptor = PeftModel.from_pretrained(model, code_adaptor_path)
+gsm_adaptor = PeftModel.from_pretrained(model, gsm_adaptor_path, adapter_name="gsm_specialist")
+gsm_adaptor.set_adapter("gsm_specialist")
+code_adaptor = PeftModel.from_pretrained(model, code_adaptor_path, adapter_name="code_specialist")
 
 naive_merged_model_dict = OrderedDict()
 
 lora_modules = ['q_proj', 'v_proj', 'k_proj', 'o_proj']
 
 for name, param in gsm_adaptor.named_parameters():
+    if "code_specialist" in name:
+        continue
     for lora_name in lora_modules:
-        if lora_name in name:
-            naive_merged_model_dict[name] = (param.data + code_adaptor.get_parameter(name).data) / 2
+        if lora_name in name and "lora" in name:
+            print(name)
+            code_param = name.replace("gsm_specialist", "code_specialist")
+            res_param_name = name.replace("gsm_specialist", "naive_merged")
+            naive_merged_model_dict[res_param_name] = (param.data + code_adaptor.get_parameter(code_param).data) / 2
+            print(naive_merged_model_dict[res_param_name].shape)
             break
         else:
             naive_merged_model_dict[name] = param.data.clone()

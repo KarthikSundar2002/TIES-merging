@@ -1,268 +1,234 @@
-import argparse
-import json
-import os
-import re
-from pathlib import Path
-from typing import Optional, Tuple
-
 import torch
+import re
+import json
+from pathlib import Path
 from datasets import load_dataset
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from tqdm import tqdm
+from typing import Optional, Tuple
+from collections import OrderedDict
 
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+
+# Set this to the base model you used for training
+BASE_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
+
+# These paths must match your training/merging scripts
+ADAPTER_DIRS = {
+    "gsm_specialist": Path("/scratch/ks02450/lora-finetuned-gsm8k"),
+    "code_specialist": Path("/scratch/ks02450/lora-finetuned-code-adaptor"),
+}
+
+MERGED_STATE_DICTS = {
+    "naive_merge": Path("/scratch/ks02450/qwen_models/4B-Instruct-2507/naive_merged_model.pth"),
+    "ties_merge": Path("/scratch/ks02450/qwen_models/4B-Instruct-2507/ties_merged_model.pth"),
+}
+
+# Evaluation settings
+DATASET_SPLIT = "test"
+MAX_NEW_TOKENS = 256
+TEMPERATURE = 0.0 # Set to 0.0 for deterministic greedy output
+TOP_P = 0.95
+SEED = 42
+
+# ----------------------------------------------------------------------
+# Helper Functions (from your eval.py)
+# ----------------------------------------------------------------------
 
 def _extract_gold_answer(text: str) -> str:
+    """Extracts the gold answer from the 'answer' field."""
     match = re.search(r"####\s*([^\n]+)", text)
     if not match:
         return text.strip()
     return match.group(1).strip()
 
-
 def _extract_number(text: str) -> Optional[str]:
+    """Extracts the last numerical value from generated text."""
+    # This regex is improved to find the *last* number
     numbers = re.findall(r"-?\d[\d,]*\.?\d*", text)
     if not numbers:
+        # Fallback: check for numbers in format like 'Final Answer: X'
+        final_match = re.search(r"[Ff]inal [Aa]nswer:\s*(-?\d[\d,]*\.?\d*)", text)
+        if final_match:
+            return final_match.group(1).replace(",", "").strip()
         return None
-    # Take the last number-like token as the final answer
     candidate = numbers[-1]
     return candidate.replace(",", "").strip()
 
-
 def _compare_answers(pred: Optional[str], gold: str) -> bool:
+    """Compares predicted and gold answers."""
     if pred is None:
         return False
     pred_norm = pred.replace(",", "").strip()
     gold_norm = gold.replace(",", "").strip()
     return pred_norm == gold_norm
 
-
-def build_prompt(question: str, style: str = "mistral_inst") -> str:
-    if style == "mistral_inst":
-        return (
-            f"[INST] You are a careful math tutor. Solve the problem step by step. "
-            f"Return only the final numeric answer at the end after the phrase 'Final Answer:'.\n\n"
-            f"Problem: {question} [/INST]"
-        )
-    # Fallback plain style
-    return (
-        "You are a careful math tutor. Solve the problem step by step and return only "
-        "the final numeric answer at the end after 'Final Answer:'.\n\n"
-        f"Problem: {question}\nAnswer:"
-    )
-
+def build_prompt(question: str) -> str:
+    """Builds the inference prompt in the Mistral/Qwen INST format."""
+    # Using the instruction format from your training scripts
+    return f"[INST] {question} [/INST]"
 
 @torch.no_grad()
 def generate_answer(
     model,
     tokenizer,
     question: str,
-    max_new_tokens: int = 256,
-    temperature: float = 0.2,
-    top_p: float = 0.95,
-    prompt_style: str = "mistral_inst",
 ) -> Tuple[str, Optional[str]]:
-    prompt = build_prompt(question, prompt_style)
+    """Generates an answer and extracts the predicted number."""
+    prompt = build_prompt(question)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    
     output_ids = model.generate(
         **inputs,
-        do_sample=temperature > 0,
-        temperature=temperature,
-        top_p=top_p,
-        max_new_tokens=max_new_tokens,
+        do_sample=TEMPERATURE > 0,
+        temperature=TEMPERATURE,
+        top_p=TOP_P,
+        max_new_tokens=MAX_NEW_TOKENS,
         pad_token_id=tokenizer.eos_token_id,
     )
-    text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    # Try to find explicit 'Final Answer:' first
-    final_match = re.search(r"Final Answer:\s*(.+)", text, flags=re.IGNORECASE)
-    if final_match:
-        pred = _extract_number(final_match.group(1))
-    else:
-        pred = _extract_number(text)
+    # Get the text that was *generated*, not including the prompt
+    generated_ids = output_ids[0][inputs.input_ids.shape[1]:]
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    # Extract the number from the *generated* text
+    pred = _extract_number(text)
     return text, pred
 
+# ----------------------------------------------------------------------
+# Main Evaluation Loop
+# ----------------------------------------------------------------------
 
-def load_base_and_adapter(
-    base_model: str,
-    adapter_dir: str,
-    load_in_4bit: bool = True,
-    torch_dtype=torch.bfloat16,
-):
-    quant_config = None
-    if load_in_4bit:
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch_dtype,
-        )
+def run_evaluation_suite():
+    """
+    Loads the base model once and evaluates all specialist and
+    merged adapters against the GSM8K test set.
+    """
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
+    # --- 1. Load Base Model, Tokenizer, and Data ---
+    print(f"Loading base model: {BASE_MODEL_ID}")
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+    
     model = AutoModelForCausalLM.from_pretrained(
-        base_model,
+        BASE_MODEL_ID,
         device_map="auto",
-        torch_dtype=torch_dtype,
+        torch_dtype=torch.bfloat16,
         quantization_config=quant_config,
     )
-    model = PeftModel.from_pretrained(model, adapter_dir)
-    tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
+    
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
-    return model, tokenizer
 
-
-def evaluate_gsm8k(
-    base_model: str,
-    adapter_dir: str,
-    split: str = "test",
-    subset: Optional[int] = None,
-    seed: int = 42,
-    max_new_tokens: int = 256,
-    temperature: float = 0.2,
-    top_p: float = 0.95,
-    output_path: Optional[str] = None,
-) -> None:
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    model, tokenizer = load_base_and_adapter(base_model, adapter_dir)
-    model.eval()
-
+    print("Loading GSM8K test data...")
     ds = load_dataset("gsm8k", "main")
-    data = ds[split]
+    data = ds[DATASET_SPLIT]
+    
+    # Pre-process all gold answers
+    gold_answers = [_extract_gold_answer(item["answer"]) for item in data]
+    questions = [item["question"] for item in data]
+    
+    results_summary = {}
 
-    if subset is not None and subset > 0:
-        data = data.select(range(min(subset, len(data))))
+    # --- 2. Load All Specialist Adapters ---
+    print("\nLoading specialist PEFT adapters...")
+    # Load the first adapter which also creates the PeftModel structure
+    first_adapter_name = list(ADAPTER_DIRS.keys())[0]
+    first_adapter_path = ADAPTER_DIRS[first_adapter_name]
+    model = PeftModel.from_pretrained(model, first_adapter_path, adapter_name=first_adapter_name)
+    model.set_adapter(first_adapter_name)
+    
+    # Load remaining specialist adapters
+    for name, path in ADAPTER_DIRS.items():
+        if name == first_adapter_name:
+            continue
+        print(f"Loading adapter: {name}")
+        model.load_adapter(path, adapter_name=name)
 
-    correct = 0
-    total = 0
+    # --- 3. Evaluate Specialist Adapters ---
+    print("\n--- Evaluating Specialist Adapters ---")
+    for name in ADAPTER_DIRS.keys():
+        print(f"\nSetting active adapter: {name}")
+        model.set_adapter(name)
+        model.eval()
+        # model = PeftModel.from_pretrained(model, ADAPTER_DIRS[name])
+        
+        correct = 0
+        predictions = []
+        # questions = questions[:2]
+        for i, q in enumerate(tqdm(questions, desc=f"Evaluating {name}")):
+            gen_text, pred = generate_answer(model, tokenizer, q)
+            is_correct = _compare_answers(pred, gold_answers[i])
+            correct += int(is_correct)
+            predictions.append({"pred": pred, "gold": gold_answers[i], "correct": is_correct})
+        
+        accuracy = (correct / len(questions)) * 100
+        results_summary[name] = accuracy
+        print(f"Accuracy for {name}: {accuracy:.2f}% ({correct}/{len(questions)})")
 
-    results_path = None
-    writer = None
-    if output_path:
-        results_path = Path(output_path)
-        results_path.parent.mkdir(parents=True, exist_ok=True)
-        writer = results_path.open("w", encoding="utf-8")
+    # --- 4. Evaluate Merged Adapters (State Dicts) ---
+    print("\n--- Evaluating Merged Adapters ---")
+    for name, path in MERGED_STATE_DICTS.items():
+        print(f"\nLoading state_dict for: {name}")
+        
+        # We must have *some* adapter active to have the LoRA layers in the model
+        # We then overwrite its weights with our merged state_dict
+        #model.set_adapter(first_adapter_name) 
+        #model.set_adapter("default")
+        try:
+            state_dict = torch.load(path, map_location="cpu")
+            new_dict = OrderedDict()
+            for key in state_dict.keys():
+                if "default" in key:
+                    new_key = key.replace("default", "gsm_specialist")
+                    new_dict[new_key] = state_dict[key]
+                  
+                elif "naive_merged" in key:
+                    new_key = key.replace("naive_merged", "gsm_specialist")
+                    new_dict[new_key] = state_dict[key]
+            
+                else:
+                    new_dict[key] = state_dict[key]
+            e = model.load_state_dict(new_dict, strict=False)
+            print(e)
+            print(f"Successfully loaded state_dict from {path}")
+        except Exception as e:
+            print(f"ERROR loading state_dict for {name}: {e}")
+            continue
+        model.set_adapter("gsm_specialist")
+        model.eval()
+        correct = 0
+        predictions = []
+        
+        for i, q in enumerate(tqdm(questions, desc=f"Evaluating {name}")):
+            gen_text, pred = generate_answer(model, tokenizer, q)
+            is_correct = _compare_answers(pred, gold_answers[i])
+            correct += int(is_correct)
+            predictions.append({"pred": pred, "gold": gold_answers[i], "correct": is_correct})
+            
+        accuracy = (correct / len(questions)) * 100
+        results_summary[name] = accuracy
+        print(f"Accuracy for {name}: {accuracy:.2f}% ({correct}/{len(questions)})")
 
-    for idx, item in enumerate(data):
-        q = item["question"]
-        gold_full = item["answer"]
-        gold = _extract_gold_answer(gold_full)
-
-        gen_text, pred = generate_answer(
-            model=model,
-            tokenizer=tokenizer,
-            question=q,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            prompt_style="mistral_inst",
-        )
-
-        is_correct = _compare_answers(pred, gold)
-        correct += int(is_correct)
-        total += 1
-
-        record = {
-            "id": idx,
-            "question": q,
-            "gold_answer": gold,
-            "raw_gold": gold_full,
-            "prediction": pred,
-            "correct": bool(is_correct),
-            "generated_text": gen_text,
-        }
-        if writer is not None:
-            writer.write(json.dumps(record) + "\n")
-
-        if (idx + 1) % 25 == 0:
-            acc = correct / total if total else 0.0
-            print(f"Processed {idx + 1} examples - running accuracy: {acc:.4f}")
-
-    if writer is not None:
-        writer.close()
-
-    accuracy = correct / total if total else 0.0
-    print(f"\nFinal accuracy on GSM8K ({split}, n={total}): {accuracy:.4f}")
-    if results_path is not None:
-        print(f"Saved detailed predictions to: {results_path}")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate a LoRA adaptor on GSM8K.")
-    parser.add_argument(
-        "--adapter_dir",
-        type=str,
-        required=True,
-        help="Path to the trained PEFT/LoRA adaptor directory.",
-    )
-    parser.add_argument(
-        "--base_model",
-        type=str,
-        default="mistralai/Mistral-7B-Instruct-v0.2",
-        help="Base model to load before merging the adaptor.",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="test",
-        choices=["train", "test"],
-        help="GSM8K split to evaluate on.",
-    )
-    parser.add_argument(
-        "--subset",
-        type=int,
-        default=None,
-        help="If set, evaluate on only the first N examples.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for generation.",
-    )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=256,
-        help="Max new tokens to generate per question.",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.2,
-        help="Sampling temperature (0 for greedy).",
-    )
-    parser.add_argument(
-        "--top_p",
-        type=float,
-        default=0.95,
-        help="Top-p nucleus sampling.",
-    )
-    parser.add_argument(
-        "--output_path",
-        type=str,
-        default=None,
-        help="Optional path to write JSONL predictions.",
-    )
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    evaluate_gsm8k(
-        base_model=args.base_model,
-        adapter_dir=args.adapter_dir,
-        split=args.split,
-        subset=args.subset,
-        seed=args.seed,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        output_path=args.output_path,
-    )
+    # --- 5. Final Summary ---
+    print("\n\n--- Final Evaluation Summary ---")
+    print("-----------------------------------")
+    for name, acc in results_summary.items():
+        print(f"{name:<20}: {acc:.2f}%")
+    print("-----------------------------------")
 
 
 if __name__ == "__main__":
-    main()
-
+    run_evaluation_suite()
 

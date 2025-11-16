@@ -156,7 +156,7 @@ def run_evaluation_suite():
         print(f"Loading adapter: {name}")
         model.load_adapter(path, adapter_name=name)
 
-    # --- 3. Evaluate Specialist Adapters ---
+    --- 3. Evaluate Specialist Adapters ---
     print("\n--- Evaluating Specialist Adapters ---")
     for name in ADAPTER_DIRS.keys():
         print(f"\nSetting active adapter: {name}")
@@ -181,27 +181,32 @@ def run_evaluation_suite():
     print("\n--- Evaluating Merged Adapters ---")
     for name, path in MERGED_STATE_DICTS.items():
         print(f"\nLoading state_dict for: {name}")
-        
+        # if name == "naive_merge":
+        #     continue
         # We must have *some* adapter active to have the LoRA layers in the model
         # We then overwrite its weights with our merged state_dict
-        #model.set_adapter(first_adapter_name) 
+        model.set_adapter(first_adapter_name) 
         #model.set_adapter("default")
         try:
             state_dict = torch.load(path, map_location="cpu")
             new_dict = OrderedDict()
             for key in state_dict.keys():
                 if "default" in key:
+                    print(key)
                     new_key = key.replace("default", "gsm_specialist")
                     new_dict[new_key] = state_dict[key]
                   
                 elif "naive_merged" in key:
                     new_key = key.replace("naive_merged", "gsm_specialist")
                     new_dict[new_key] = state_dict[key]
-            
+                elif "ties_merged" in key:
+                    print(key)
+                    new_key = key.replace("ties_merged", "gsm_specialist")
+                    new_dict[new_key] = state_dict[key]
                 else:
                     new_dict[key] = state_dict[key]
             e = model.load_state_dict(new_dict, strict=False)
-            print(e)
+            #print(e)
             print(f"Successfully loaded state_dict from {path}")
         except Exception as e:
             print(f"ERROR loading state_dict for {name}: {e}")
@@ -222,7 +227,7 @@ def run_evaluation_suite():
         print(f"Accuracy for {name}: {accuracy:.2f}% ({correct}/{len(questions)})")
 
     # --- 5. Final Summary ---
-    print("\n\n--- Final Evaluation Summary ---")
+    print("\n\n--- Final Evaluation Summary ---")d
     print("-----------------------------------")
     for name, acc in results_summary.items():
         print(f"{name:<20}: {acc:.2f}%")
